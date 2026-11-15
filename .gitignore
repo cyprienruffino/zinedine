@@ -1,0 +1,23 @@
+# The game and anything derived from it: bring your own copy (see README)
+/SoccerPhysics/
+/decompiled/
+/BepInEx_linux_x64_*/
+
+# Training outputs (checkpoints, logs, snapshot pools); the launch scripts runs/*.sh are kept
+/runs/*
+!/runs/*.sh
+/runs_train.log
+
+# Environments and build outputs
+/.venv/
+/.venv-sf/
+__pycache__/
+*.egg-info/
+plugin/SoccerRL/bin/
+plugin/SoccerRL/obj/
+
+# Local
+/lost+found/
+/.claude/
+.idea/
+.vscode/
