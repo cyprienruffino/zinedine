@@ -31,6 +31,7 @@ FL_BALL_TOUCHING_P1 = 1 << 4
 FL_BALL_TOUCHING_P2 = 1 << 5
 
 _HEADER = struct.Struct("<qiiiiiffi")
+_U32 = struct.Struct("<I")
 
 
 @dataclass
@@ -112,20 +113,43 @@ class SoccerClient:
                 time.sleep(0.1)
         self.sock.settimeout(None)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        self._rbuf = bytearray(1 << 16)  # reused receive buffer (see _fill / _take)
+        self._rview = memoryview(self._rbuf)
+        self._rlen = 0
         self.body_names: list[str] = []
         self.info_cache: dict[str, str] = {}
 
     # --- framing -----------------------------------------------------------------------------
-    def _recv_exact(self, n: int) -> bytes:
-        buf = bytearray(n)
-        view = memoryview(buf)
-        got = 0
-        while got < n:
-            k = self.sock.recv_into(view[got:], n - got)
+    def _fill(self, n: int) -> None:
+        """Read from the socket until at least n bytes are buffered. Reads as much as is available, so a
+        whole message (4-byte length + payload) usually arrives in a single recv_into call."""
+        while self._rlen < n:
+            if n > len(self._rbuf):
+                self._rbuf.extend(bytes(n - len(self._rbuf)))
+                self._rview = memoryview(self._rbuf)
+            k = self.sock.recv_into(self._rview[self._rlen:])
             if k == 0:
                 raise ConnectionError("game closed the connection")
-            got += k
-        return bytes(buf)
+            self._rlen += k
+
+    def _take(self, n: int) -> bytes:
+        """Consumes n buffered bytes (a copy, so returned data never aliases the reused buffer)."""
+        self._fill(n)
+        out = bytes(self._rview[:n])
+        rest = self._rlen - n
+        if rest:
+            self._rview[:rest] = self._rview[n:self._rlen]
+        self._rlen = rest
+        return out
+
+    def _recv_exact(self, n: int) -> bytes:
+        return self._take(n)
+
+    def _recv_message(self) -> bytes:
+        """One length-prefixed message (u32 length, then payload), usually with one system call."""
+        self._fill(4)
+        (n,) = _U32.unpack_from(self._rbuf, 0)
+        return self._take(4 + n)[4:]
 
     def _send(self, data: bytes) -> None:
         self.sock.sendall(data)
@@ -136,12 +160,10 @@ class SoccerClient:
         return struct.pack("<I", len(b)) + b
 
     def _recv_str(self) -> str:
-        (n,) = struct.unpack("<I", self._recv_exact(4))
-        return self._recv_exact(n).decode() if n else ""
+        return self._recv_message().decode()
 
     def _recv_state(self) -> State:
-        (n,) = struct.unpack("<I", self._recv_exact(4))
-        buf = self._recv_exact(n)
+        buf = self._recv_message()
         gt, et, s1, s2, ev, fl, ts, fdt, nb = _HEADER.unpack_from(buf, 0)
         off = _HEADER.size
         bodies = np.frombuffer(buf, dtype="<f4", count=nb * 6, offset=off).reshape(nb, 6)

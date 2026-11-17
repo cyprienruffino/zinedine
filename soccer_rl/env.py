@@ -324,7 +324,10 @@ class SoccerPhysicsEnv(gym.Env):
         if self.opponent == "random":
             r = self.np_random.random(2) < 0.3
             return (int(r[0]), int(r[1])) if self.two_buttons else (int(r[0]), int(r[0]))
-        # Policy opponent: give it its own egocentric observation.
+        # Policy opponent: give it its own egocentric observation, unless it says it doesn't need one
+        # (the duel env drives the opponent's buttons itself and builds that view on its own).
+        if getattr(self.opponent, "needs_obs", True) is False:
+            return self._buttons(self.opponent(None))
         obs = self._view(st, not self.mirror)
         return self._buttons(self.opponent(obs))
 
@@ -356,10 +359,16 @@ class SoccerPhysicsEnv(gym.Env):
             frame = self._last_obs.get(mirror)
             if frame is None:
                 raise
-        if self.time_feature:
-            frame = np.append(frame, np.float32(min(self._point_steps / self.clock_horizon, 1.0)))
-        if self.modifier_feature:
-            frame = np.concatenate([frame, self._mods_vec])
+        if self.time_feature or self.modifier_feature:
+            full = np.empty(self.frame_dim, np.float32)  # one allocation instead of append + concatenate
+            n = len(frame)
+            full[:n] = frame
+            if self.time_feature:
+                full[n] = min(self._point_steps / self.clock_horizon, 1.0)
+                n += 1
+            if self.modifier_feature:
+                full[n:n + 7] = self._mods_vec
+            frame = full
         if self.history == 1:
             return frame
         frames = self._frames.get(mirror)
@@ -373,6 +382,8 @@ class SoccerPhysicsEnv(gym.Env):
         """Egocentric observation: own player, own goalie, their player, their goalie, ball.
         mirror=True flips the x axis so that the observing team always attacks towards -x."""
         body_idx, player_idx = self._indices(st, mirror)
+        if self.obs_version == "v2":
+            return self._obs_v2(st, mirror, body_idx, player_idx)
         b = st.bodies[body_idx].astype(np.float32)  # (25, 6)
         x, y, ang, vx, vy, w = b.T
         if mirror:
@@ -387,6 +398,33 @@ class SoccerPhysicsEnv(gym.Env):
         if self._norm is not None:
             frame = np.clip((frame - self._norm[0]) / self._norm[1], -10.0, 10.0)
         return frame
+
+    # x, y, angle, vx, vy, angular velocity: mirroring flips x, angle, vx and angular velocity.
+    _MIRROR = np.array([-1, 1, -1, -1, 1, -1], np.float32)
+    _SCALE = np.array([1 / 5.0, 1 / 5.0, 1 / 10.0, 1 / 10.0, 1 / 500.0], np.float32)  # x, y, vx, vy, w
+
+    def _obs_v2(self, st: State, mirror: bool, body_idx: np.ndarray, player_idx: np.ndarray) -> np.ndarray:
+        """Same frame as the original v2 code (within float32 rounding), with far fewer temporary arrays:
+        it runs twice per duel step in every env, so it was a large share of the rollout workers' CPU."""
+        b = st.bodies[body_idx]  # (25, 6) float32 (fancy indexing already copies)
+        if mirror:
+            b *= self._MIRROR
+        n = len(body_idx)
+        out = np.empty(n * BODY_FEATURES + 4 * (PLAYER_FLAGS + PLAYER_TIMERS), np.float32)
+        f = out[:n * BODY_FEATURES].reshape(n, BODY_FEATURES)
+        rad = np.deg2rad(b[:, 2])
+        f[:, 0:2] = b[:, 0:2] * self._SCALE[0:2]
+        np.sin(rad, out=f[:, 2])
+        np.cos(rad, out=f[:, 3])
+        f[:, 4:7] = b[:, 3:6] * self._SCALE[2:5]
+        out[n * BODY_FEATURES:] = st.players[player_idx][:, [0, 1, 3, 4, 5]].ravel()
+        if self._norm is not None:
+            if not hasattr(self, "_inv_std"):
+                self._inv_std = (1.0 / self._norm[1]).astype(np.float32)
+            np.subtract(out, self._norm[0], out=out)
+            np.multiply(out, self._inv_std, out=out)
+            np.clip(out, -10.0, 10.0, out=out)
+        return out
 
     def _info(self, st: State) -> dict:
         mine, theirs = (st.p2_score, st.p1_score) if self.mirror else (st.p1_score, st.p2_score)

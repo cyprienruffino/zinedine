@@ -27,7 +27,9 @@ class SoccerDuelEnv(gym.Env):
         super().__init__()
         self._action = 0
         # The inner env runs the game for P1 (agent 0); agent 1's buttons come from self._action.
-        self.inner = SoccerPhysicsEnv(side="p1", opponent=lambda _obs: self._action, draw_penalty=draw_penalty,
+        opponent = lambda _obs: self._action  # noqa: E731
+        opponent.needs_obs = False  # agent 1's view is built below (_p2_obs); don't build it twice
+        self.inner = SoccerPhysicsEnv(side="p1", opponent=opponent, draw_penalty=draw_penalty,
                                       shaping=shaping, **env_kwargs)
         self.view = SoccerPhysicsEnv(side="p1", **env_kwargs)  # no game: builds agent 1's own (mirrored) history
         self.draw_penalty, self.switch_cost = draw_penalty, switch_cost

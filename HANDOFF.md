@@ -301,6 +301,19 @@ gymnasium 0.29):
   (max logit difference 4e-6). Headless matches keep all 25 bodies (no observation change).
   `SnapshotOpponent` and `elo.py` trim each frame for older snapshots (784/780 inputs); `elo.py` has
   `--modifiers random --modifier-feature` to rate players on random variants. `runs/sf5.sh`.
+- Day 13 throughput fixes: Sample Factory pins each learner to 1 torch thread (patched: `--learner_threads`,
+  default 4), `--num_epochs 2`, and back to 2 policies (two learners in parallel). Supervisors now also
+  *grow* a running run when RAM frees up (restart once ≥ 4 more workers fit).
+- sf5 results (days 13–15): **first confirmed classic gain.** Over three 30-games-per-pair rounds the
+  later p1 snapshots beat sf5's start by ~+30–50 and sf3's best by ~+30–60 (best: p1 at 1.22B samples,
+  1131 classic). On random variants, the whole frozen-opponent line (sf4/sf5, including its start)
+  rates ~30–40 above sf3/sf1, but the modifier inputs add nothing measurable yet.
+- Throughput by setup: MLP duels (sf1) ~8k samples/s; GRU duels (sf2/sf3) ~5k; GRU vs frozen opponents
+  (sf4/sf5) ~3.4k (1 sample per game step, plus a numpy opponent per worker); much lower when RAM-limited.
+- **sf6 (day 15, 01:24): back to self-play duels** from sf5's latest checkpoints (1.28B per policy),
+  same obs and settings: **~7,000–7,400 samples/s** on 14 workers (CPU-bound, load ~32). Experiment:
+  does it match sf5's gains at equal training time? If newer snapshots start losing to older ones,
+  bring frozen opponents back. `runs/sf6.sh`.
 - Queue after sf2 (GRU only, for a clean comparison): add `time_feature` (episode clock), so agents
   can see the draw penalty coming and break stalemates on purpose.
 - Day 2, 17:00 Elo (3 snapshots per policy): p2 1082 → 1082 (71M → 168M samples), p0 1058 → 1058,

@@ -36,7 +36,15 @@ torch.load = functools.partial(torch.load, weights_only=False)
 from sample_factory.cfg.arguments import parse_full_cfg, parse_sf_args  # noqa: E402
 from sample_factory.utils.utils import str2bool  # noqa: E402
 from sample_factory.envs.env_utils import register_env  # noqa: E402
+from sample_factory.algo.learning import learner_worker  # noqa: E402
 from sample_factory.train import run_rl  # noqa: E402
+
+# Sample Factory pins every learner to 1 torch thread (learner_worker calls init_torch_runtime(cfg) with its
+# default max_num_threads=1). With a single policy, that one thread does all the GRU backprop and caps the run
+# at ~2.5-3k samples/s whatever the worker count. Give learners --learner_threads instead.
+_init_torch_runtime = learner_worker.init_torch_runtime
+learner_worker.init_torch_runtime = lambda cfg, max_num_threads=1: _init_torch_runtime(
+    cfg, max_num_threads=getattr(cfg, "learner_threads", max_num_threads))
 
 from soccer_rl.duel import SoccerDuelEnv, SoccerVsPoolEnv  # noqa: E402
 
@@ -82,6 +90,8 @@ def add_env_args(parser):
                         help="match modifiers: classic only, or rolled per episode with the game's own probabilities")
     parser.add_argument("--modifier_feature", type=str2bool, default=False,
                         help="append the episode's modifiers to the observation (7 values per frame)")
+    parser.add_argument("--learner_threads", type=int, default=4,
+                        help="torch threads per learner process (Sample Factory's default is 1)")
     parser.add_argument("--opponent_pool", type=str, default="",
                         help="comma-separated snapshot dirs: play frozen past opponents instead of self-play duels")
     parser.add_argument("--opponent_recent_frac", type=float, default=0.5,
