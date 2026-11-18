@@ -314,6 +314,28 @@ gymnasium 0.29):
   same obs and settings: **~7,000–7,400 samples/s** on 14 workers (CPU-bound, load ~32). Experiment:
   does it match sf5's gains at equal training time? If newer snapshots start losing to older ones,
   bring frozen opponents back. `runs/sf6.sh`.
+- Day 15, sf6 after 12 h of duels: round-to-round noise (snapshots swinging ±30–40 between rounds) made
+  the broad rating rounds useless for decisions, so I switched to **600-game head-to-heads**
+  (`runs/sf/h2h_sf6_*.txt`, ±14). Result: sf6 latest (1.435B), sf6's start (= sf5 final) and sf5's
+  champion (p1 at 1.22B) are **equal within 10 Elo**, classic and random variants. Both duels and
+  frozen opponents have plateaued at this level.
+- `runs/sf7.sh`: frozen opponents from sf5's final weights, with sf6's snapshots and the exploiter's
+  (`runs/sf/sf8_exploit/pool_p0`) added to the pool. **Started day 18, 22:00** (resumed at 1.279B/1.280B).
+- **sf8_exploit (day 15, 16:42):** league-style exploiter. One policy trained only against the frozen
+  champion (`runs/sf/champion_pool/`: sf6 p0 at 1.435B), warm-started from sf6 p0's latest. Its
+  training win rate against the champion measures the champion's exploitable headroom.
+  `runs/sf8_exploit.sh`.
+- Exploiter after ~9 h: win 35% → 39%, loss 37% → 35% (draws ~27%). The champion has only small
+  exploitable weaknesses. Sanity check: the champion against itself through `SoccerVsPoolEnv` comes out
+  roughly even (37% / 32% over 100 games; P2 does somewhat better), so the frozen-opponent env isn't
+  biased. **Gotcha:** in Sample Factory's summaries, a tag matching "loss" can be a training-loss scalar,
+  not the game loss rate; use 1 − win − draw.
+- **Exploiter verdict (day 18, after ~29 h, 1.556B):** win 37%, loss 36%, draw 27%; the edge never grew
+  (9 h: 39/33, 27 h: 41/40). The champion has no exploitable weakness this method can find. Stopped;
+  its snapshots now feed sf7's pool for diversity.
+- Supervisor restarts can fail with "Components take too long to start" (28 games plus learners booting at
+  once on a loaded machine); the supervisor retries and the next attempt succeeds.
+- A 1-policy run (exploiter) is single-learner-bound: ~1,500–4,000 samples/s.
 - Queue after sf2 (GRU only, for a clean comparison): add `time_feature` (episode clock), so agents
   can see the draw penalty coming and break stalemates on purpose.
 - Day 2, 17:00 Elo (3 snapshots per policy): p2 1082 → 1082 (71M → 168M samples), p0 1058 → 1058,
