@@ -330,6 +330,12 @@ gymnasium 0.29):
   roughly even (37% / 32% over 100 games; P2 does somewhat better), so the frozen-opponent env isn't
   biased. **Gotcha:** in Sample Factory's summaries, a tag matching "loss" can be a training-loss scalar,
   not the game loss rate; use 1 − win − draw.
+- **Learning-rate bug (found day 19):** on resume, Sample Factory restores the learning rate from the
+  checkpoint and ignores `--learning_rate`. sf1/sf2 trained at 3e-4, so every warm-started run since (sf3–sf8)
+  ran at 3e-4, not the 1e-4 in its script. `examples/train_sf.py` now forces the command-line value; check
+  `train/lr` in TensorBoard after a restart. sf7 runs at a real 1e-4 from 1.339B/1.338B (day 19, 14:30).
+- sf7's supervisor thrashed (70 stop/starts overnight, ~2k samples/s instead of ~3.4k): with the larger
+  opponent pool, a worker takes ~0.75 GB, not 0.45. `runs/sf7.sh` now sizes at 700 MB per worker.
 - **Exploiter verdict (day 18, after ~29 h, 1.556B):** win 37%, loss 36%, draw 27%; the edge never grew
   (9 h: 39/33, 27 h: 41/40). The champion has no exploitable weakness this method can find. Stopped;
   its snapshots now feed sf7's pool for diversity.

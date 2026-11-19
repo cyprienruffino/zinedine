@@ -46,6 +46,23 @@ _init_torch_runtime = learner_worker.init_torch_runtime
 learner_worker.init_torch_runtime = lambda cfg, max_num_threads=1: _init_torch_runtime(
     cfg, max_num_threads=getattr(cfg, "learner_threads", max_num_threads))
 
+# On resume, Sample Factory takes the learning rate from the checkpoint (curr_lr) and ignores --learning_rate
+# (only PBT can change it). Every warm-started run since sf3 kept sf1/sf2's 3e-4 instead of the 1e-4 we asked
+# for. With a constant schedule, the command line wins.
+from sample_factory.algo.learning.learner import Learner  # noqa: E402
+_load_state = Learner._load_state
+
+
+def _load_state_cfg_lr(self, checkpoint_dict, load_progress=True):
+    _load_state(self, checkpoint_dict, load_progress)
+    if self.cfg.lr_schedule == "constant" and self.curr_lr != self.cfg.learning_rate:
+        print(f"learning rate from checkpoint {self.curr_lr} replaced by --learning_rate {self.cfg.learning_rate}")
+        self.curr_lr = self.cfg.learning_rate
+        self._apply_lr(self.curr_lr)
+
+
+Learner._load_state = _load_state_cfg_lr
+
 from soccer_rl.duel import SoccerDuelEnv, SoccerVsPoolEnv  # noqa: E402
 
 ENV = "soccer_duel"

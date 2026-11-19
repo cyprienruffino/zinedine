@@ -38,7 +38,7 @@ while true; do
     # Grow a running run when RAM frees up (it only ever shrank before): restart it bigger once at least 4 more
     # workers fit with 1 GB to spare above the floor. Resumes from checkpoints; costs about a minute.
     cur=\$(ps -o args= -p "\$pid" | grep -o -- '--num_workers [0-9]*' | awk '{print \$2}')
-    extra=\$(( (avail - 3500 - 1000) / 450 ))
+    extra=\$(( (avail - 3500 - 1000) / 700 ))
     if [[ -n "\$cur" ]] && (( extra >= 4 && cur < 14 )); then
       kill -INT "\$pid"; for _ in \$(seq 20); do kill -0 "\$pid" 2>/dev/null || break; sleep 3; done
       kill -- -"\$(ps -o pgid= -p "\$pid" | tr -d ' ')" 2>/dev/null
@@ -52,7 +52,7 @@ while true; do
     # sf2 (GRU, 2 policies since day 6) has ~3 GB of fixed overhead (learners ~0.9 GB each, inference workers
     # ~0.55 GB each) plus ~0.45 GB per worker. Only start when >= 4 workers fit above the 3.5 GB floor:
     # smaller runs barely train and just thrash between stop and start.
-    workers=\$(( (avail - 3500 - 3000 - 500) / 450 )); (( workers > 14 )) && workers=14
+    workers=\$(( (avail - 3500 - 3000 - 500) / 700 )); (( workers > 14 )) && workers=14
     if (( workers < 2 )); then sleep 30; continue; fi  # small runs are slow, but better than idle
     start \$workers
     echo "\$(date '+%F %H:%M') started with \$workers workers: \${avail} MB available"
