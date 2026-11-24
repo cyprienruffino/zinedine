@@ -334,6 +334,12 @@ gymnasium 0.29):
   checkpoint and ignores `--learning_rate`. sf1/sf2 trained at 3e-4, so every warm-started run since (sf3–sf8)
   ran at 3e-4, not the 1e-4 in its script. `examples/train_sf.py` now forces the command-line value; check
   `train/lr` in TensorBoard after a restart. sf7 runs at a real 1e-4 from 1.339B/1.338B (day 19, 14:30).
+- **First confirmed gain since sf5 (day 24):** after ~770M samples per policy at the real 1e-4, sf7 p0
+  (2.108B) beats the champion (sf6 p0 1.435B) by +33 / +34 / +26 Elo in three 12,600-game head-to-heads
+  (classic seed 0, classic seed 7, random variants; `runs/sf/h2h_sf7_*.txt`). p1 (2.135B): +15 / +21 / +17.
+  sf7 p0 just after the fix (1.341B) rates level with the old champion, so the learning rate was a cap.
+  New champion: `runs/sf/champion_pool/champion_sf7_p0_2108M.npz`. sf7 keeps training; if it flattens,
+  try 3e-5 next.
 - sf7's supervisor thrashed (70 stop/starts overnight, ~2k samples/s instead of ~3.4k): with the larger
   opponent pool, a worker takes ~0.75 GB, not 0.45. `runs/sf7.sh` now sizes at 700 MB per worker.
 - **Exploiter verdict (day 18, after ~29 h, 1.556B):** win 37%, loss 36%, draw 27%; the edge never grew
