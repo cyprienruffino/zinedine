@@ -1,392 +1,458 @@
-# Handoff: Soccer Physics RL tooling
+# Handoff: Soccer Physics RL
 
-Status as of 2026-11-02 morning, after the first overnight training session on the new machine
-(Intel Core Ultra 7 366H, 16 cores, 30 GB). `README.md` covers usage, architecture, the wire protocol
-and gotchas; this file covers state, measurements, findings and what's next.
+Training was stopped on **2026-11-25 at 15:00 (Paris)** so it can resume on another machine.
+`README.md` covers setup, usage, architecture, the wire protocol and game gotchas. This file covers
+the current state, how to resume, the training setup, results, findings and what's next, followed by
+the full history.
 
-## Goal and preferences
+Day numbers in the history are dates in November 2026: day 1 = 2026-11-01, day 24 = 2026-11-24.
 
-Cyprien wants RL tooling for *Soccer Physics* (Unity 2022.1.7f1, Mono) via BepInEx, then a strong
-agent.
+## 1. Current state
 
-- **The policy is single-button** (`two_buttons=False`, `Discrete(2)`).
-- **Keep scope tight.** Propose before adding big features. Cyprien delegated the training
-  curriculum overnight ("I trust you").
-- **No sound.** Launched games must be silent (now enforced, see below).
+- **Latest run: sf7**, stopped cleanly at 15:00 with final checkpoints at **p0 2.271B / p1 2.302B samples**
+  (`checkpoint_000820178_2270625792.pth`, `checkpoint_000827768_2301714432.pth`). Nothing is running.
+- **Champion: sf7 p0 at 2.108B samples**, `runs/sf/champion_pool/champion_sf7_p0_2108M.npz`.
+  It beat the previous champion (sf6 p0 at 1.435B) by +26 to +34 Elo in three 12,600-game
+  head-to-heads (§4).
+- **Why sf7 improved:** a learning-rate bug was fixed on day 19. Every warm-started run since sf3
+  had trained at 3e-4 instead of the 1e-4 in its script (§5.1). This is the first confirmed gain
+  since sf5.
+- **Final check (day 25, 12,600 games, classic):** sf7 p0 at 2.244B = 1121, the champion = 1118,
+  sf7 p1 at 2.273B = 1117, the old sf6 champion = 1090. sf7 has **flattened** since 2.108B (+3, within
+  ±14). Per §6, the next step is lowering the learning rate to 3e-5.
+- **Code:** everything is pushed to https://github.com/cyprienruffino/zinedine (`main`).
+- **Training data:** `runs/` is git-ignored. To resume, the checkpoints and opponent pools are in
+  the GitHub release **sf7-final-2026-11-25**.
 
-## What exists
+## 2. How to resume on a new machine
+
+1. Clone the repo and do the README's **Setup** section: game copy in `./SoccerPhysics/`,
+   `scripts/install_bepinex.sh`, `scripts/build_plugin.sh`, and both venvs (`.venv` for SB3/elo,
+   `.venv-sf` for Sample Factory). Versions known to work in `.venv-sf`: Python 3.12.13,
+   sample-factory 2.1.1, torch 2.15.0+cpu, numpy 1.26.4, gymnasium 0.29.1.
+2. Check the game runs: `.venv/bin/python examples/quickstart.py`. On a non-NixOS machine,
+   `SOCCER_RL_WRAPPER=""` disables the steam-run wrapper. Inside Claude Code's sandbox the game
+   can't start, so run game commands with the sandbox disabled.
+3. Download the release assets and extract them at the repo root. Archive paths start with `runs/sf/`:
+   ```bash
+   gh release download sf7-final-2026-11-25 --repo cyprienruffino/zinedine --dir /tmp/zin
+   for f in /tmp/zin/*.tar.gz; do tar xzf "$f"; done
+   ```
+   That restores the following:
+   - `runs/sf/sf7/{config.json,checkpoint_p0,checkpoint_p1}`: the latest checkpoint of each
+     policy.
+   - Every opponent-pool directory sf7 samples from: `runs/sf/sf{4,5,6,7}/pool_p{0,1}` and
+     `runs/sf/sf8_exploit/pool_p0`.
+   - `runs/sf/champion_pool/` and the head-to-head sets `runs/sf/h2h_sf6`, `runs/sf/h2h_sf7` and
+     `runs/sf/h2h_sf7b`.
+4. **Resume sf7.** Pick one of two ways:
+   - **Shared laptop:** `bash runs/sf7.sh` starts the RAM-aware supervisor (§3.5).
+   - **Dedicated machine:** run the trainer directly, with workers ≈ (free RAM − 7 GB) / 0.75 GB,
+     max ~1 per core:
+     ```bash
+     setsid nohup .venv-sf/bin/python examples/train_sf.py --experiment sf7 --num_workers 14 \
+       --num_envs_per_worker 2 --num_policies 2 --switch_cost 0 --shaping 0.02 \
+       --anneal_env_steps 4000000 --draw_penalty 0.6 --use_rnn True --rnn_type gru --rnn_size 256 \
+       --recurrence 64 --time_feature True --learning_rate 0.0001 --max_episode_steps 1000 \
+       --num_epochs 2 --modifiers random --modifier_feature True \
+       --opponent_pool runs/sf/sf4/pool_p0,runs/sf/sf4/pool_p1,runs/sf/sf5/pool_p0,runs/sf/sf5/pool_p1,runs/sf/sf6/pool_p0,runs/sf/sf6/pool_p1,runs/sf/sf7/pool_p0,runs/sf/sf7/pool_p1,runs/sf/sf8_exploit/pool_p0 \
+       >> runs/sf/sf7.log 2>&1 < /dev/null &
+     setsid nohup .venv-sf/bin/python scripts/export_sf.py runs/sf/sf7 --every 1800 >> runs/sf/sf7.export.log 2>&1 < /dev/null &
+     ```
+     The exporter must run too: it writes sf7's own snapshots into `pool_p*`, which sf7 also plays
+     against. This is sf7's exact configuration so far (lr 1e-4). For the recommended next step
+     (§6.1), use `--learning_rate 0.00003`, here or in `runs/sf7.sh`.
+5. **Verify the resume** within the first minutes. Both checks have failed silently before:
+   - `grep "Loaded experiment state" runs/sf/sf7/sf_log.txt | tail -2` must show ~2.27B / 2.30B
+     samples per policy. "Did not load" means it started from scratch (§5.2).
+   - TensorBoard `train/lr` must be 1e-4 (`runs/sf/sf7/.summary/{0,1}`). 3e-4 means the
+     learning-rate patch isn't applied (§5.1).
+6. **Monitor progress:**
+   - Training stats: `.venv-sf/bin/python scripts/sf_stats.py runs/sf/sf7 --points 4` (win, draw,
+     tap share per policy). The game loss rate is 1 − win − draw, not the "loss" tag.
+   - Decisions: use 600-games-per-pair head-to-heads (§3.6), never broad rounds.
+
+## 3. Training setup (sf7)
+
+### 3.1 Algorithm and infrastructure
+- Sample Factory 2.1.1 **APPO** (asynchronous PPO), CPU only. Settings:
+  - 2 learning policies, each with its own learner (`--learner_threads 4`);
+  - workers × 2 games each (`--num_envs_per_worker 2`);
+  - rollout 128, batch 8192, 1 batch per epoch, 2 epochs;
+  - PPO clip 0.2, value clip 1.0, value loss coefficient 0.5;
+  - entropy coefficient 0.003, max gradient norm 0.5;
+  - Adam (eps 1e-6), constant learning rate **1e-4**;
+  - gamma 0.999, GAE λ 0.98;
+  - returns normalized, no V-trace, `max_policy_lag` 1000.
+- **Frozen-opponent mode** (`SoccerVsPoolEnv`): each game is one learner against a `SnapshotOpponent`.
+  - The opponent is a NumPy copy of a snapshot, drawn from the `--opponent_pool` directories, with
+    `recent_frac` 0.5: the newest half of each directory's history.
+  - The opponent changes every episode and keeps its own GRU state and stacked view.
+  - Learners play both sides; observations are mirrored, so one policy plays either side.
+- **Duel mode** (`SoccerDuelEnv`, used by sf1–sf3 and sf6): both teams are learners.
+- Patches in `examples/train_sf.py`. All are module-level, because the spawned learners re-import
+  the script:
+  - `torch.load(weights_only=False)`: without it, every resume silently restarts from scratch (§5.2);
+  - the learner thread count;
+  - OMP/OPENBLAS/MKL threads set to 1;
+  - **`--learning_rate` wins over the checkpoint's stored rate** (§5.1).
+
+### 3.2 Network (~670k weights)
+- Input: 812 = 4 stacked frames × 203.
+- Encoder: MLP 256-256, tanh.
+- Core: GRU 256, trained on sequences of 64 steps (`--recurrence 64`).
+- Heads: a 2-logit policy (single button: press or release) and a value head. Actor and critic
+  share weights.
+- Orthogonal initialization.
+- `scripts/export_sf.py` exports the policy to `.npz` (`w0, b0, w1, b1, gru_*, w_out, b_out`).
+  `soccer_rl.selfplay.NumpyPolicy` runs it; it matches Sample Factory to 1e-7.
+
+### 3.3 Observation (per frame, 203 values)
+- `obs="v2"`: egocentric and mirrored for P2. Body states are normalized with
+  `soccer_rl/obs_stats_v2.npz`.
+- It includes the hidden jump timers `jumpLimiter` and `jump2delay` for each player.
+- Point clock (`time_feature`): steps since kickoff / horizon, reset after each goal.
+- 7 match-modifier values (`modifier_feature`).
+- `history=4` frames.
+- `frame_skip=2`: the game runs 50 physics ticks/s, so that's 25 decisions per second. The point
+  timeout `max_episode_steps=1000` is 40 s.
+- Older snapshots that lack the clock (780 inputs) or the modifiers (784 inputs) are trimmed
+  automatically by `SnapshotOpponent` and `elo.py`.
+
+### 3.4 Reward (per agent, zero-sum goals)
+- Goal: ±1.
+- **Draw: −0.6** for any goalless end, both timeout and ball out.
+  - Timeout and ball out must cost the same, otherwise agents kick the ball out on purpose
+    (Cyprien's call).
+  - Kickoff-to-timeout counts as one episode.
+- Shaping: 0.02 × ball progress, faded linearly to 0 over each env's first 4M steps. The fade
+  resumes from checkpoint sample counts (`steps_done_per_env`), so in sf7 it's long gone.
+- No switch cost (anti-mashing penalty) and no macro actions: both are Cyprien's call. Mashing is
+  fine if it wins.
+- Match modifiers are rolled per episode with the game's own probabilities (`--modifiers random`).
+
+### 3.5 Supervisor (`runs/sfN.sh` → `runs/sf/sfN.supervise.sh`)
+Built for Cyprien's laptop (16 cores, 30 GB, shared with his work). It acts on free RAM:
+
+| Free RAM | Action |
+|---|---|
+| < 3.5 GB | Kill the training process group |
+| > 7.9 GB | Start with (free − 7 GB) / 700 MB workers, max 14 |
+| ≥ 4 more workers fit | Grow a running run (SIGINT, so a checkpoint is saved first) |
+
+It also keeps the exporter running. The log is `runs/sf/sfN.supervisor.log`. Rerunning
+`runs/sfN.sh` is safe: it won't start a second supervisor.
+
+To stop it cleanly:
+1. Kill the supervisor (`*.supervise.sh`).
+2. Kill the exporter.
+3. SIGINT the trainer and wait up to ~3 min: it writes a final checkpoint.
+4. Kill the trainer's process group, which takes the games with it.
+
+RAM per sf7 worker is about 0.75 GB (games + NumPy opponents). Fixed overhead is about 3 GB
+(learners + inference). With 14 workers sf7 runs at ~3.4–4k samples/s.
+
+### 3.6 Evaluation
+- `examples/elo.py <dirs of .npz> --games 600 --procs 3 --time-feature --modifier-feature
+  --modifiers none|random [--seed N]`.
+- It runs a round-robin of all `.npz` files in the given directories plus `idle`, `random` and `pulse`,
+  then a Bradley-Terry fit anchored at **idle = 1000**.
+- 600 games per pair gives about ±14 per player. A 4-player set takes ~1 h 20 min on 3 processes.
+- The broad rounds of the early days (24–60 games per pair) swung ±30–90 between rounds and misled
+  several decisions.
+- Rule: confirm any single +2σ result before calling it progress. sf7's gain was confirmed three
+  times.
+- Watch two bots: `examples/watch.py --snapshot A.npz --opponent-snapshot B.npz [--argmax]`. To play
+  against a bot yourself, use `--human`.
+
+## 4. Results
+
+### Strength over time (Elo, idle = 1000)
+
+| Agent | Elo | Source |
+|---|---|---|
+| Built-in AI | below idle | idle beats it 49% / 13% |
+| SB3 PPO / ES best (days 1–3) | ~1090 | `runs/final2/elo_final.txt`, 60 games per pair |
+| sf3 / sf5 / sf6 plateau (days 7–18) | ~1090–1100 | `runs/sf/h2h_sf6_*.txt` |
+| sf7 p0 at 1.341B (right after the learning-rate fix) | 1082–1092 | `runs/sf/h2h_sf7_*.txt` |
+| sf7 p1 at 2.135B | 1107–1116 | same |
+| **sf7 p0 at 2.108B (champion)** | **1125–1128** | same |
+| sf7 p0 at 2.244B / p1 at 2.273B (day 25) | 1121 / 1117 (champion 1118, sf6 1090) | `runs/sf/h2h_sf7b_none.txt` |
+
+The three day-24 head-to-heads had 12,600 games each and 7 players. All used the classic variant
+except one on random modifiers.
+
+| Player | Classic, seed 0 | Classic, seed 7 | Random variants |
+|---|---|---|---|
+| sf7 p0, 2.108B | 1125 | 1128 | 1125 |
+| sf7 p1, 2.135B | 1107 | 1115 | 1116 |
+| champion sf6 p0, 1.435B | 1092 | 1094 | 1099 |
+| sf7 p0, 1.341B | 1082 | 1090 | 1092 |
+| random / pulse | 938 / 938 | 939 / 929 | 970 / 961 |
+
+Human check (day 3): Cyprien, by his own words "terrible at this game", beat the best ES agent 5–3.
+There's no human baseline against the current agents yet.
+
+### Run lineage
+`sf1` (MLP duels) → `sf2` (GRU) → `sf3` (+clock, shorter points) → `sf4` (frozen opponents) →
+`sf5` (+modifiers) → `sf6` (back to duels) → `sf7` (frozen opponents, larger pool, real lr 1e-4).
+`sf8_exploit` is a side branch from sf6 p0.
+
+## 5. Bugs and findings that matter
+
+1. **Learning rate on resume (day 19).** Sample Factory restores `curr_lr` from the checkpoint, and
+   only PBT can change it afterwards. sf1/sf2 saved 3e-4, so sf3–sf8 all ran at 3e-4 despite
+   `--learning_rate 0.0001`. Fixed in `train_sf.py`.
+   - The gradient norm sat at the 0.5 clip limit on every update, so steps were as large as
+     allowed.
+   - Training at the real 1e-4 produced the first gain in about 10 days. This is consistent with
+     arXiv 2603.06009: PPO plateaus when the step size is too large for the gradient noise, and a
+     smaller step or a larger batch is the fix.
+   - The day-7 note "SF applies the new constant rate" was wrong.
+2. **Resume silently restarted from scratch (day 4).** torch ≥ 2.6 defaults to `weights_only=True`,
+   which rejects SF's checkpoints; SF then logs "Did not load from checkpoint, starting from
+   scratch!" and carries on. Fixed by the `torch.load` patch. Always grep for "Loaded experiment
+   state".
+3. **Idle is the real baseline.** Never pressing wins 49% / loses 13% against the built-in AI. An
+   unpressed player stays upright like a wall, and one press tilts them for seconds. The built-in AI
+   is useless as a benchmark.
+4. **Agents mash:** 68–76% of presses last one decision. Cyprien accepts this if it wins. They show
+   two modes: "maintain" (hold) near their own goal and "mash" near the opponent's.
+5. **The exploiter found no weakness** (sf8_exploit, ~29 h against the frozen sf6 champion: 37% won,
+   36% lost). It was warm-started from the champion itself, so this is weak evidence (§6).
+6. **The frozen-opponent env is unbiased:** the champion against itself comes out ~even, with P2
+   slightly better.
+7. **Modifier inputs** add nothing measurable yet. The frozen-opponent line rates ~30–40 higher on
+   random variants mainly because it trained on them.
+8. **Diagnostics on sf7** (day 19, still at 3e-4):
+   - policy entropy 0.078 nats (the maximum is 0.69), so it's almost deterministic per step;
+   - KL 0.016 per update, 1.7% of samples clipped;
+   - policy lag ~0.9 versions;
+   - `valids_fraction` 0.906: ~9% of samples are dropped as off-policy at policy switches.
+
+## 6. Next steps (ranked)
+
+From the day-19 literature review (sources below):
+
+1. **Resume sf7 at 3e-5** (`--learning_rate 0.00003`; the patch applies it on resume). sf7 gained
+   ~+35 Elo between 1.34B and 2.11B at 1e-4, then flattened by 2.24B. If 3e-5 also stalls, raise the
+   batch instead (`--num_batches_per_epoch 4` or `--rollout 256`). Same principle: less step noise
+   per update. Judge after ≥ 300M samples per policy with a 600-games-per-pair head-to-head against
+   `champion_sf7_p0_2108M.npz`.
+2. **Exploiter from scratch, or from a much older snapshot, with a higher entropy coefficient**
+   (0.01) against the new champion.
+   - AlphaStar reset its exploiters to a non-main initialization to get a different play style.
+   - Our exploiter inherited the champion's near-deterministic play.
+   - It beating the champion > 55% would prove there's headroom left.
+3. **Bigger network, only after 1–2.** A plain MLP gets worse when widened (SimBa, ICLR 2025;
+   CHAIN, arXiv 2409.04792). If tried:
+   - use SimBa-style residual blocks + LayerNorm + running observation normalization;
+   - a wider critic, which matters more than the actor;
+   - a lower learning rate, trained from scratch;
+   - the expected obstacle is RAM/CPU on the laptop.
+4. **Plasticity loss** (Dohare et al., Nature 2024): the sf4→sf7 lineage has trained the same
+   weights for 2B+ samples in a changing self-play setting. Possible checks: count saturated tanh
+   units on real observations, or try shrink-and-perturb. Caveat: runs from scratch plateaued at the
+   same level too.
+5. **Human baseline against the current champion** (`watch.py --human`). It would settle whether
+   the ceiling is the game or the methods. Cyprien prefers not to play more (he's "terrible"), so
+   ask before relying on it.
+
+Literature checked:
+- Bansal 2018 (competitive self-play, shaping annealed to 0, opponent sampling): matches what we do.
+- Liu et al. 2019 (MuJoCo soccer, population-based training).
+- AlphaStar 2019 and TStarBot-X (exploiter resets).
+- SimBa / SimbaV2 (scaling networks in RL) and CHAIN (PPO degrades when widened).
+- Dohare 2024 and the 2024 plasticity survey (arXiv 2411.04832).
+- arXiv 2603.06009 (PPO stagnation; fix with a smaller step or more samples per update).
+
+## 7. Repo map
 
 | Path | What |
 |---|---|
-| `SoccerPhysics/` | Game with BepInEx 5.4.23.6 |
-| `plugin/SoccerRL/` | Plugin source (`Bridge.cs`, `Patches.cs`, `Introspect.cs`, `Plugin.cs`); build with `scripts/build_plugin.sh` |
-| `soccer_rl/` | `client.py`, `launcher.py` (`GameProcess`), `env.py` (`SoccerPhysicsEnv`), `selfplay.py` (snapshots, PFSP, press prior) |
-| `soccer_rl/obs_stats_v2.npz` | Feature mean/std used by `obs="v2"`; regenerate with `scripts/obs_stats.py` |
-| `examples/train_ppo.py` | PPO vs built-in AI / idle / random; flags for every hyperparameter, `--press-prior`, `--press-cost` + `--anneal`, `--obs`, `--history` |
-| `examples/train_selfplay.py` | Self-play PPO with a PFSP snapshot pool, plus `--builtin-envs` and `--idle-envs` as yardsticks |
-| `examples/evaluate.py` | Parallel evaluation vs `--opponent builtin/idle/random`, ± margin |
-| `examples/duel.py` | Head-to-head between two models (`path[:obs[:history]]`), alternating sides |
-| `runs/night/` | Overnight runs: `<name>_logs/progress.csv`, `<name>_ckpt/`, `<name>_pool/`; `status.py` summarises them, `launch.sh` starts a detached run |
-| `runs/night/final/` | Final checkpoints of the best self-play runs, `eval.txt`, `duel.txt` |
+| `plugin/SoccerRL/` | BepInEx plugin (C#, Harmony): lockstep TCP bridge, introspection, mute |
+| `soccer_rl/env.py` | `SoccerPhysicsEnv`: obs v1/v2, history, clock, modifiers, shaping, draw penalty |
+| `soccer_rl/duel.py` | `SoccerDuelEnv` (two learners), `SoccerVsPoolEnv` (learner vs frozen snapshot) |
+| `soccer_rl/selfplay.py` | `NumpyPolicy` (MLP/GRU), `SnapshotOpponent`, PFSP pool helpers |
+| `soccer_rl/client.py`, `launcher.py` | Wire protocol client, game process launcher (silent, per-instance config) |
+| `soccer_rl/noise.py` | Correlated (pink/red) exploration noise for SB3 |
+| `examples/train_sf.py` | Sample Factory training (duels or `--opponent_pool`), with the patches in §3.1 |
+| `examples/elo.py` | Round-robin + Bradley-Terry ratings (`--builtin`, `--modifiers`, `--argmax-pools`) |
+| `examples/watch.py` | Watch bot vs bot, bot vs built-in AI, or play against a bot (`--human`) |
+| `examples/train_ppo.py`, `train_selfplay.py`, `train_es.py` | Early SB3 PPO / self-play / ES pipelines (`.venv`) |
+| `scripts/export_sf.py` | SF checkpoints → `.npz` pools (`--every 1800` keeps running) |
+| `scripts/expand_sf_obs.py` | Warm-start surgery: add zero-weighted inputs, Adam moments included |
+| `scripts/sf_stats.py` | Per-policy win/draw/tap stats over time from SF summaries |
+| `scripts/install_bepinex.sh`, `build_plugin.sh` | Setup |
+| `runs/sf1.sh` … `runs/sf8_exploit.sh` | Launch scripts with their supervisors; the header comment says what each run is |
 
-Not a git repo yet; nothing is committed.
+Never commit the game, its DLLs, decompiled code or decompile scripts; the repo is public.
+Commit as `ruffino.cyprien@protonmail.com`.
 
-## Changes made in this session
+## 8. Gotchas
 
-- **Single reload per episode**: `auto_reload` setting; goal-mode envs turn off the game's own
-  post-goal reload (it was immediately overwritten by `reset()`). 58 → 32 scene loads per 30 episodes.
-- **Silence**: the plugin mutes from `Awake`, and the launcher makes PulseAudio/ALSA unreachable
-  (`sound=False` default), so games open no audio stream at all.
-- **Hidden jump timers exposed**: `jumpLimiter` (10-tick cooldown after a jump) and `jump2delay`
-  (second boost after 3 ticks) are sent as player fields 5–6 (protocol change: 6 fields per player).
-- **`obs="v2"`**: v1 + the timers, normalized with measured mean/std (leg heights were scaled ~10×
-  too small; the ball never rotates, so its spin and cos(angle) are constants).
-- **`history=n`**: frame stacking inside the env; policy opponents get their own stacked view.
-- **Opponent hooks**: env calls `opponent.reset()` each episode; `info["opponent_id"]`;
-  `set_shaping` / `set_press_cost` for annealing through SB3 wrappers (`set_attr` stops at Monitor).
+- **Sandbox:** the game can't run inside Claude Code's sandbox (steam-run's bwrap can't nest, SIGSYS).
+  Disable the sandbox for game commands, `gh` and `git push`.
+- **git push:** plain `git push` fails because no credential helper is configured. Use
+  `git -c credential.helper= -c 'credential.helper=!gh auth git-credential' push origin main`. Stage
+  explicit paths: the sandbox mounts device files in the repo root that break `git add -A`.
+- **pkill self-matching:** `pkill -f <pattern>` inside a command whose text contains the pattern
+  kills that command. Use `[t]rain_sf`-style patterns.
+- **`TaskStop` on a shell that launched `setsid nohup` runs kills them too:** launch from a command
+  that exits immediately.
+- **Claude Code kills background watchers under memory pressure** (day 20). Sf7 then trained for
+  4 days unwatched; re-arm watchers after any such notice.
+- **zsh doesn't word-split `$var`:** use explicit arguments or `${=var}`.
+- **TMPDIR differs inside and outside the sandbox.**
+- **OpenBLAS thread storm** with NumPy opponents (load 145): thread counts must be 1. `train_sf.py`
+  sets them.
+- **SF summary tag "loss"** can be a training-loss scalar; the game loss rate is 1 − win − draw.
+- **SF's log counter restarts each session;** use checkpoint sample counts for progress.
+- **Restarts can fail** with "Components take too long to start" on a loaded machine; the supervisor
+  retries.
+- **`keep_checkpoints` 5** sorts by name. That's fine now resumes work, but it deleted fresh
+  checkpoints back when resumes silently restarted from zero.
+- **Windowed game freezes** without `runInBackground` (the plugin forces it on). Logs vanish under
+  `steam-run` (private `/tmp`), so the launcher captures stdout instead.
+- **The built-in AI only drives P2.**
+- **SubprocVecEnv scripts need `if __name__ == "__main__":`**, and in the sandbox `uv` needs
+  `UV_CACHE_DIR` set to a temp dir.
 
-## Measurements (new machine)
+---
 
-| Measurement | Result |
-|---|---|
-| Raw throughput | 1 game 5,988 ticks/s; 16 games 28,416 ticks/s total (7,104 env-steps/s at frame_skip 4) |
-| SB3 `SubprocVecEnv`, 16 envs, no learning | 2,792 steps/s: lockstep means every step waits for whichever game is reloading |
-| PPO, 16 envs | ~2,200 steps/s (torch threads don't matter); 32 envs barely better |
-| 3–4 runs × 16 envs side by side | ~1,000–1,100 steps/s each (~4,500 total): the way to use the CPU |
+## History
 
-## Key findings
+### Day 1–2 (2026-11-01/02): tooling, first training
+New machine: Intel Core Ultra 7 366H, 16 cores, 30 GB.
 
-1. **Never pressing beats the built-in AI**: idle wins ~49%, loses ~13% (goal diff +0.36–0.40 per
-   episode). An unpressed player stays upright like a wall; one press tilts the players 25–47° for
-   seconds. Pressing on just 0.5% of steps drops it to 37% / 57%. Random wins 36% / loses 52%.
-   **The built-in AI is a broken benchmark**: no heuristic or PPO run beat idle against it.
-2. **PPO is bimodal here**: starting near idle (`--press-prior 0.0005`) collapses to pure idle;
-   anything above ~0.2% drifts to pressing on ~40% of steps. A per-press reward cost (even 0.01 per
-   step) didn't stop the drift.
-3. **Long horizon needed**: idle wins arrive late (median 509 steps at frame_skip 2), so use
-   gamma 0.999 and GAE λ 0.98.
-4. **Self-play with an idle yardstick works but plateaus**: starting from an active PPO policy,
-   self-play went from about −0.3 to +0.09 goals per episode against a standing opponent within
-   ~3M steps, then flattened. A lower learning rate (1e-4) didn't help.
+Changes:
+- One reload per episode.
+- Silence enforced: the plugin mutes in `Awake`, and the launcher makes audio unreachable.
+- Hidden jump timers exposed: `jumpLimiter` (10-tick cooldown) and `jump2delay` (second boost after
+  3 ticks).
+- `obs="v2"`, normalized. Leg heights had been scaled ~10× too small, and ball spin is constant.
+- `history=n` frame stacking.
+- Opponent hooks and annealing setters.
 
-## Final results (400 episodes each, argmax actions unless noted)
+Throughput:
+- 1 game runs 5,988 ticks/s; 16 games run 28,416 ticks/s.
+- SB3 `SubprocVecEnv` lockstep with 16 envs: 2,792 steps/s; PPO ~2,200.
+- 3–4 runs side by side: ~4,500 steps/s in total.
 
-| Policy | vs built-in AI won / lost | vs idle won / lost |
-|---|---|---|
-| Idle | 49% / 13% | — |
-| `sp3_from_r10` (self-play, 12.8M steps) | 39.5% / 35.5% | 41.2% / 32.5% |
-| `sp7_lr1e4` (sp3 continued at lr 1e-4) | 37.2% / 43.5% | 43.0% / 34.3% |
-| `sp6_from_r10_diverse` | 33.2% / 43.5% | 38.2% / 35.0% |
+Findings:
+- Idle beats the built-in AI. PPO is bimodal: it either collapses to idle or drifts to ~40% presses.
+- A long horizon is needed (gamma 0.999, λ 0.98).
+- Self-play plateaued around +0.09 goals per episode against idle.
+- Final results: `sp3_from_r10` 39.5% won / 35.5% lost against the built-in AI. All self-play runs
+  were equal head-to-head.
 
-Head-to-head (300 episodes per pair, `runs/night/final/duel.txt`): all three are indistinguishable
-(48.9–50.7% of decided games), so the self-play runs converged to similar strength.
+### Day 2: research (no training during Cyprien's workday)
+Cyprien's direction:
+- self-play;
+- no macro actions;
+- a draw penalty ("the goal is to win, not to draw");
+- question the architecture and algorithm.
 
-## Day 2 (2026-11-02): research and preparation (no training during the day)
+Literature:
+- Correlated (pink) action noise (Eberhard ICLR 2023; Hollenstein AAAI 2024, β≈0.5 for PPO).
+- Bansal 2018: shaping annealed to 0 over 10–15% of training; opponents drawn from the recent half
+  of history.
+- Slime Volleyball: fixed yardsticks mislead, so use Elo.
 
-Cyprien's direction: **self-play is the way**; **no macro actions** (keep full per-step control, fix
-behaviour through rewards and exploration instead); **draw penalty** ("the goal is to win, not to draw");
-question the architecture and algorithm instead of assuming them.
+Added:
+- `CorrelatedPolicy`;
+- `draw_penalty`, covering any goalless end;
+- `time_feature`;
+- terminal ball-outs and timeouts (SB3 used to bootstrap past them);
+- `elo.py`.
 
-Diagnosis: per-step independent sampling explores with scattered taps, the worst behaviour in this game.
-Literature notes:
-- Correlated (pink) action noise beats white noise for exploration (Eberhard et al., ICLR 2023). For
-  PPO, noise between white and pink (β≈0.5) worked best (Hollenstein et al., AAAI 2024). Both papers
-  cover Gaussian policies only; for our Bernoulli policy, sampling by inverse CDF from a correlated
-  uniform keeps each step's marginal exact.
-- Bansal et al. 2018 (competitive self-play): dense rewards linearly annealed to 0 over 10–15% of
-  training beat agents that kept them; opponents drawn from the recent half of history worked best.
-- Slime Volleyball Gym: PPO self-play beat directly trained PPO head-to-head yet scored worse against
-  the fixed baseline. Fixed yardsticks mislead, so use Elo (as Unity ML-Agents does).
+### Night 2 (runs/n2): noise and KL
+- PPO with obs v2 was thrashing: approx_kl 0.13–0.16 per update. Fixed with `--target-kl 0.02`.
+- Standing still is the best scripted strategy against every opponent. Pressing begets pressing:
+  once tilted, pressing is the only way to move.
+- Pink/red noise gave a small edge at best.
+- Every PPO variant hit the same ceiling: frame_skip 4, a 512×512 network, near-idle priors, bigger
+  batches. The best agents were ~+90 Elo over idle.
+- ES self-play tied PPO (es4_bigpop 1091, PPO E_pink 1090).
+- Added `runs/n2/memguard.sh`.
 
-New code:
-- `soccer_rl/noise.py`: `CorrelatedPolicy` (SB3 policy, `--noise-beta`), `CorrelatedUniform`.
-  Verified: exact press rates; at β=1 and P=0.05, half as many separate presses, twice as long.
-  Learns CartPole and survives save/load.
-- Env: `draw_penalty` (any goalless end, timeout or ball out, so kicking the ball out can't dodge it),
-  `time_feature` (episode clock in the obs). **Fix**: ball-out and visible timeouts are now terminal;
-  SB3 used to bootstrap past them as if play continued.
-- Self-play: `--noise-beta` (opponents sample with the same noise), `--draw-penalty`,
-  `--time-feature`, press-rate logging. `--init` now copies weights into a freshly configured model,
-  so sampling and hyperparameters can change.
-- `examples/elo.py`: round-robin between snapshots from one or more pools (plus idle and random) and a
-  Bradley-Terry fit, anchored at idle = 1000.
+### Day 3: human check, switch to Sample Factory
+- Cyprien beat the best ES agent 5–3; agents mash (68–76% one-decision taps).
+- Cyprien: **count runs in days**. SB3's lockstep wasted most of the machine (one env steps in
+  1.3 ms, a 16-env lockstep step takes ~5 ms).
+- Sample Factory APPO in `.venv-sf`: `SoccerDuelEnv`, `train_sf.py`, `export_sf.py`, `runs/sf1.sh`
+  with a supervisor.
+- **sf1** settings: 4 MLP policies, 10 workers × 2 games, ~7k samples/s. Its reward: goal ±1, draw
+  −0.6 (timeout after 2,000 steps or ball out), shaping 0.02 fading over 4M steps.
+- Day-1 adjustments: a switch cost of 0.005 made agents hold forever, so it went to 0. Draw penalty
+  0.3 → 0.6. The shaping fade now resumes from checkpoints (`steps_done_per_env`).
+- Day 2 rounds: sf1 kept improving (p0 1075 → 1103, PPO E 993). Ratings drift ±50–90 between rounds,
+  so compare only within a round.
+- Cyprien watched p0 vs p2 and saw the maintain/mash modes. Measured: near its own goal p0 holds 87–89%
+  of the time; near the opponent's it presses 52–59% with 2–3-step holds. Midfield stalemates
+  happen when both sides are in maintain mode.
+- **sf2 (GRU 256, recurrence 64)** started day 3, 16:06. It matched sf1's best with ~10× fewer
+  samples per policy. GRU support is end to end (export, NumpyPolicy, elo/watch reset the hidden
+  state).
 
-## Night 2 plan (`runs/tonight.sh`, runs under `runs/n2/`)
+### Day 4–6: the resume bug, sf3
+- Day 4: SF had never resumed (torch `weights_only`). sf1's 47 restarts and several sf2 sessions
+  started from zero. Fixed. sf2 has ~6 GB of fixed RAM overhead with 4 GRU learners.
+- Day 6: sf2 sat idle for 2 days (its supervisor waited for RAM), so it was cut to 2 policies.
+  Watchdogs were added.
+- **sf3** (day 6, 22:52): sf2 plus a point clock, which restarts after goals. Warm-started with zero
+  weights on the new inputs (`expand_sf_obs.py`). `watch.py` match mode was fixed for reloads.
 
-| Run | Start | Noise β | Other |
-|---|---|---|---|
-| A_pink | sp3 | 1 | draw penalty 0.3 |
-| B_red | sp3 | 2 | draw penalty 0.3 |
-| C_pink_scratch | scratch | 1 | draw penalty 0.3, shaping 0.02 fading over 10M |
-| D_white | sp3 | 0 | draw penalty 0.3 (control for the noise) |
+### Day 7–10: sf3 curriculum
+- Day 7 decision round: the 1174 seen at 12 h was mostly noise, and sf3 was flat with ~20% draws.
+  The learning rate was changed 3e-4 → 1e-4. **Per §5.1 it never actually applied.**
+- Curriculum agreed with Cyprien:
+  1. consolidate;
+  2. stalemate pressure (point timeout 2000 → 1500 → 1000);
+  3. frozen-opponent pool;
+  4. random variants.
+- At 1500 steps, draws stayed the same while points got shorter. ~60% of draws were timeouts and
+  ~40% ball-outs, and both keep the same penalty.
+- At 1000 steps (day 8, 17:22), agents adapted and scored faster. Elo held, then plateaued by day 10.
+- The "lower draw penalty" variant was dropped: it makes stalling cheaper.
 
-Decision rules, applied without waiting for Cyprien:
-- **Every ~2 h**: `examples/elo.py runs/n2/*_pool runs/night/sp3_from_r10_pool --max-players 4
-  --games 12 --procs 8`.
-- **Replace the 2 lowest runs** (by the Elo of their newest snapshot) with variants of the best: a
-  larger rollout (`--n-steps 2048`), draw penalty 0.5, lr 1e-4, or a bigger network from scratch
-  (`--net 512,512`).
-- **Watch `press_rate`** for collapse (→ 0) or saturation.
-- **Stop all training in the morning** before Cyprien's workday.
+### Day 10–15: frozen opponents (sf4, sf5), throughput
+- **sf4** (day 10): GRU policies against frozen snapshots (`SoccerVsPoolEnv`, `--opponent_pool`,
+  `recent_frac`). OpenBLAS thread storm fixed. RAM limits forced 1 learning policy.
+- Day 11: a +46 at 899M was **not confirmed** on day 12 (a ~2σ fluke). Classic strength had been
+  flat for a week.
+- **sf5** (day 12): random match modifiers, visible in the observation (frame 196 → 203). Added the
+  learner-thread patch, 2 epochs and 2 policies, and supervisors that grow a running run.
+- sf5 results: the first confirmed classic gain, about +30–50 over its start (p1 at 1.22B: 1131).
+  The frozen-opponent line rates ~30–40 higher on random variants.
+- Throughput by setup:
+  - MLP duels ~8k samples/s;
+  - GRU duels ~5–7k;
+  - frozen opponents ~3.4k;
+  - a single policy is learner-bound at 1.5–4k.
+- Env optimizations: `_obs_v2` vectorized and the client buffer reused. Env CPU per duel step fell
+  0.75 → 0.55 ms, and sf6 went ~7.2k → ~8k samples/s.
 
-## Night 2 results (2026-11-02 12:30 → 2026-11-03 08:00)
+### Day 15–18: sf6 duels, exploiter
+- **sf6** (day 15, 01:24): back to duels from sf5's final weights, at ~7,000–8,000 samples/s.
+- 600-game head-to-heads replaced broad rounds. sf6 latest (1.435B), sf6's start and sf5's champion
+  were equal within 10 Elo, on classic and random variants.
+- **sf8_exploit** (day 15, 16:42): one policy trained only against the frozen sf6 p0 champion,
+  warm-started from it.
+  - After 9 h it won 39% and lost 33%; after 29 h (1.556B) it won 37% and lost 36%.
+  - Stopped on day 18. Its snapshots feed sf7's pool.
+- Cyprien paused training overnight on days 17–18 for his own CPU task.
 
-Findings, in order:
-1. **PPO with obs v2 was thrashing**: approx_kl 0.13–0.16 per update (healthy ~0.01); every v2 run had
-   it, the v1 runs didn't. Fixed with `--target-kl 0.02` (KL now ~0.025–0.03). Always check KL first.
-2. **The plain pipeline learns, slowly**: PPO against a fixed random opponent went 40% → 54% won in 2M
-   steps, then plateaued.
-3. **Standing still is the best scripted strategy against *every* opponent tried**: against random,
-   idle wins 55.7% / loses 29.3%, better than PPO (54% / 37%) and every heuristic. Likely mechanism:
-   two regimes. A player who never pressed is an upright wall (low, heavy centre of mass); after one
-   press they're tilted for seconds and pressing is the only way to move. So pressing begets pressing,
-   and every PPO run drifts to ~40–50% presses, even from a 1% prior.
-4. **Correlated (pink/red) noise**: correct marginals, longer press runs, a small edge at best
-   (`E_pink` slightly above `F_white` in Elo, within noise).
-5. **All PPO variants hit the same ceiling** (~52% won / 30% lost vs idle, Elo ~1100 with idle =
-   1000): frame_skip 4, a 512×512 network, near-idle priors, bigger batches with lower lr. A 1,200-game
-   test confirms the skill is real but small: `E_pink` after 33M steps rated 1054 vs 971 for its
-   untrained net (+83 Elo, ~62% expected score).
-6. **ES self-play** (`examples/train_es.py`, antithetic pairs on common random numbers, centred ranks,
-   argmax play): from scratch it stalled in draws; from a PPO snapshot it improved its score against
-   idle (+0.19 → +0.33 per game), but in Elo it stays within noise of PPO (~1080–1120).
-
-Final ranking (60 games per pair, 300 games per player, noise ~±20; `runs/final2/elo_final.txt`):
-es4_bigpop 1091, PPO E_pink 1090, es5_sigma05 1085, es1_from_E 1059, random 1022, idle 1000. PPO and ES
-are tied; the best agents are ~+90 Elo over idle (~63% expected score).
-
-Tooling added: `--target-kl`, `env.set_side()`, `examples/train_es.py` (workers relaunch dead games),
-`elo.py --argmax-pools`, `runs/n2/memguard.sh` (stops a run when RAM is low).
-
-Gotchas: `TaskStop` on a shell that launched `setsid nohup` runs kills those runs too, so launch them
-from a command that exits immediately. `pkill -f <pattern>` inside a command whose own text contains
-the pattern kills that command; use `[t]rain_...` patterns or a script file.
-
-## Day 3 (2026-11-03): human check
-
-Cyprien ("terrible at this game") beat the best ES agent 5–3, the same score as against the scripted
-pulse rhythm. His remark: **the agents mash the button and rarely hold long enough for full jumps**.
-Measured: 68–76% of their presses last one decision (2 ticks), too short for the second jump boost
-(3+ ticks held); only 3–8% last 4+ decisions. Mashing is what PPO and ES start from (50% presses
-sampled independently) and they never unlearn it.
-
-Prepared for night 3 (`runs/n4.sh`, nothing running yet): an annealed **switch cost** (reward cost per
-new press, an action-rate penalty; `--switch-cost`, `--switch-anneal`) plus red/pink exploration
-noise, from scratch. Logs now include `rollout/tap_share` and `rollout/hold_mean`. `elo.py` adds
-`pulse` as a reference player (holds 6, releases 6), and `watch.py --snapshot X.npz [--argmax]` plays
-self-play snapshots.
-
-## Day 3: switch to Sample Factory for multi-day runs
-
-Cyprien: training sessions were far too short for a game with long delays between rewards; **count run
-times in days**. Profiling showed SB3's lockstep wastes most of the machine. One env steps in 1.3 ms, a
-16-env lockstep step takes ~5 ms (each step waits for the slowest game; resets 24 ms add ~20%). Raw
-capacity is ~14k env-steps/s at frame_skip 2; three SB3 runs used ~3.1k samples/s together.
-
-**Sample Factory (APPO, asynchronous)** in its own venv (`.venv-sf`, Python 3.12; it pins numpy 1.26 /
-gymnasium 0.29):
-- `soccer_rl/duel.py`: `SoccerDuelEnv`, both teams are learning agents. Zero-sum goals, per-agent
-  switch cost, draw penalty for both, per-env annealing, win/tap/hold statistics per episode.
-- `examples/train_sf.py`: population self-play (`--num_policies N`, policies mixed in every game),
-  double-buffered workers, CPU device.
-- `scripts/export_sf.py`: checkpoints → numpy snapshots for elo/watch/SB3 (verified against SF's
-  forward pass, max difference 3e-7).
-- `runs/sf1.sh`: the long run (4 policies, 10 workers × 2 games, ~7k samples/s) under a
-  **supervisor** (`runs/sf/sf1.supervise.sh`, log `runs/sf/sf1.supervisor.log`). It stops training
-  below 3.5 GB of free RAM and resumes from checkpoints above 9 GB, so the run yields to Cyprien during
-  the day and comes back on its own. It also keeps the exporter running (pools every 30 min,
-  `runs/sf/sf1/pool_p*`). Rerunning `runs/sf1.sh` is safe (it won't start a second supervisor).
-- Day-1 adjustments: switch cost 0.005 → 0 at 16:20 (it caused hold-forever play: mean holds of
-  75–500 decisions, draws up to 60%), draw penalty 0.3 → 0.6. Draws fell to 7–25% within an hour, but
-  mashing came back (taps 54–63%). Whether mashing is actually weak is open: `pulse` (no mashing)
-  rates *below* the mashing agents (966 vs 1048).
-- Watch stats with `.venv-sf/bin/python scripts/sf_stats.py runs/sf/sf1` (win, draw, taps, holds
-  per policy).
-- Reward scheme of sf1, per agent: goal ±1 (zero-sum), draw −0.6 for both (timeout after 2,000 steps
-  or ball out), shaping 0.02 × ball progress fading over each env's first 4M steps, switch cost 0.
-  The shaping fade used to restart with every supervisor restart (each env counted its own steps
-  from 0), so it never fully faded before day 2. **Fixed** (day 2): `train_sf.py` recovers per-env
-  progress from the checkpoint sample counts (`steps_done_per_env`), so the fade resumes. Applies to
-  sf1 from its next restart; it's already past the fade, so shaping stays 0.
-- Mashing: Cyprien agrees not to prevent it if it wins (the agents mash at ~50–80% taps with no loss
-  of Elo).
-- **Queued for after sf1** (Cyprien: no hurry): a run with a lower draw penalty (e.g. 0.3), since 0.6
-  may push too much risk-taking.
-- Day 3: Cyprien watched p0 vs p2 (`watch.py --snapshot ... --opponent-snapshot ...`, p0 won 5–3) and
-  saw two modes: "maintain" near their own goal, "mash" near the opponent's. Measured on p0 (30 games):
-  near its own goal it holds the button 87–89% of the time with 19–29-step holds; near the opponent's
-  goal it presses 52–59% with 2–3-step holds (22–23 new presses per 100 steps). Midfield stalemates
-  happen when both sides are in maintain mode; the ball drifting on its own breaks them.
-- **sf2 (GRU) started day 3, 16:06.** After 6 h of training (109M samples) its best policy matched
-  sf1's best; after 12 h (216M) it was level with sf1's best (1158 vs 1155 within one round) with ~10×
-  fewer samples per policy, and still climbing. Day 4: sf2 has ~6 GB of fixed RAM overhead (4 GRU
-  learners ~0.9 GB each plus inference workers), so its supervisor (`runs/sf2.sh`) only starts it when
-  ≥ 4 workers fit above the 3.5 GB floor (~11 GB free). During Cyprien's workday it mostly stays
-  paused. Progress checks use checkpoint sample counts: Sample Factory's log counter restarts each
-  session.
-- **Bug found day 4 (fixed): Sample Factory never resumed.** PyTorch ≥ 2.6 loads with
-  `weights_only=True` by default, which refuses SF 2.1.1's checkpoints; SF catches the error and logs
-  "Did not load from checkpoint, starting from scratch!". Every supervisor restart of sf1 (47 failed
-  loads) and sf2 therefore started from zero, and the new low-counter checkpoints were deleted right
-  away by `keep_checkpoints` (sorted by name). Results are still valid per session: the longest sf1
-  session ran from day 2 00:21 to day 3 15:46, and sf2's 6 h/12 h results came from one session (day 3
-  17:51 → day 4 09:49). sf2's sessions from 09:50 to 20:10 were all from scratch and are lost. **Fix**:
-  `train_sf.py` patches `torch.load(weights_only=False)` at module level (the spawned learners
-  re-import it); verified on a copy: all 4 policies load (36.9M / 67.9M / 68.6M / 56.1M samples).
-  After any restart, check the log for "Loaded experiment state", not "Did not load".
-- Day 6: sf2 sat idle for 2 days (its supervisor waited for RAM that never freed up), so it was cut to
-  2 policies (p0, and p2's weights in slot p1; old p1/p3 in `runs/sf/sf2/archive_p1_p3/`) with a
-  14-worker cap. A watchdog (background check) now wakes me after 30 min of downtime or a failed
-  resume.
-- **sf3 (day 6, 22:52): sf2 plus a point clock.** Cyprien saw both agents sit in "maintain mode" for a
-  whole point. The env's `time_feature` is now a point clock (steps since kickoff / 2000, restarting
-  after each goal, so it also works in full matches); the duel env shares it with P2's view. sf3 was
-  warm-started from sf2's latest checkpoints (p0 52.3M, p1 88.7M) with zero weights on the clock
-  inputs (`scripts/expand_sf_obs.py`, which also expands the Adam moments): identical play at start
-  (max logit difference 1e-6). It then has to learn to use the clock. `runs/sf3.sh`.
-- `watch.py` match mode: a step landing in the reload after a goal no longer crashes the env (the last
-  complete frame is reused).
-- `elo.py` can mix players with and without the clock (`--time-feature`; it strips the clock columns
-  for 780-input players). Reference players for sf3 rounds: `runs/sf/refs/` (sf2 p2 at 63M, sf1 p0,
-  PPO E).
-- sf3 progress (one uninterrupted session since day 6, 22:52): after 6 h no clear change; after 12 h
-  (322M samples, day 7, 08:53) **sf3 p1 at 181M = 1174, best ever**: +72 over its warm start and ~+50
-  over sf2's best in the same round. sf3 p0 at 138M = 1164. Draws are still 11–18% of training
-  games, so it's not yet clear the gain comes from the clock rather than from more training.
-- Day 7, 20:00 decision round (24 games per pair, about ±17 per player, `runs/sf/elo_sf3_decision.txt`):
-  sf3 p1 1073 → 1106 (89M → 277M), p0 1103 → 1070 (52M → 224M), sf1 p0 1088, PPO E 1040, sf2 p2 1030.
-  The 1174 at 12 h was mostly noise. sf3 was flat for ~a day and draws didn't fall (~20%), so the clock
-  alone didn't break stalemates. **Change: learning rate 3e-4 → 1e-4** (same experiment, resumed at
-  283M / 228M samples; SF applies the new constant rate even though the checkpoint stores the old one).
-- The "lower draw penalty" variant is on hold: it would make stalling cheaper, the opposite of the
-  stalemate goal.
-- **Curriculum** (agreed with Cyprien, day 7): (1) consolidate at lr 1e-4; (2) stalemate pressure, with
-  the point timeout shortened stepwise 2000 → 1500 → 1000 steps; (3) a frozen-snapshot opponent pool
-  against forgetting (harder in SF: frozen opponents' moves would be recorded as the learner's, so it
-  needs a separate setup); (4) random game variants. Each phase starts from the previous one's best
-  snapshot, picked in a 24-games-per-pair round.
-- Phase 1 result: flat. Rounds at 01:30 and 06:41 on day 8 put every sf3 snapshot within 1086–1129 (sf1
-  p0 ~1095, sf2 p2 ~1075, PPO E ~1020–1070), with draws at ~19–20%. **Phase 2 started day 8, 06:42**:
-  `--max_episode_steps 1500` (60 s per point) on sf3's latest checkpoints (378M / 318M samples).
-- Phase 2 at 1500 steps: draws unchanged (p0 20.7% → 19.3%, p1 23.7% → 23.7% over 10 h) while points got
-  shorter (538 → 431 and 636 → 492 steps); Elo held (latest 1084–1091, `runs/sf/elo_sf3_ph2.txt`). In
-  120 headless games, ~60% of draws were timeouts and ~40% ball-outs. Cyprien: keep timeouts and
-  ball-outs at the same penalty (a cheaper ball-out would invite kicking the ball out on purpose).
-  **Day 8, 17:22: timeout 1500 → 1000** (40 s), resumed at 402M / 475M samples.
-- Phase 2 at 1000 steps: draws rose first (p0 19.6% → 25%, p1 23.5% → 28%), then the agents adapted
-  (19.9% / 22.4% after ~21 h): no more draws despite 20 s less per point, so they score faster. Elo held
-  (p1 1139 at 703M). By day 10 sf3 had plateaued: the latest snapshots were back at their warm-start
-  level (p1 1094, p0 1115, `runs/sf/elo_sf3_d10.txt`).
-- **Phase 3: sf4 (day 10, 10:32)**: the same 2 GRU policies (from sf3's latest, 711M / 804M samples)
-  play frozen snapshots in single-agent games (`SoccerVsPoolEnv` in `soccer_rl/duel.py`,
-  `--opponent_pool` in `train_sf.py`). Opponents come from the newest half of sf3's pools plus sf4's
-  own exports; `SnapshotOpponent` takes several dirs and has `recent_frac`. `runs/sf4.sh`.
-  **Gotcha:** the numpy opponents made OpenBLAS start one thread per core in every worker (load
-  average 145, ~800 samples/s). `train_sf.py` now sets OMP/OPENBLAS/MKL threads to 1, giving
-  ~3,100 samples/s (one sample per game step).
-- Day 10 evening: the laptop's other workloads left too little RAM for 2 GRU learners,
-  so **sf4 runs 1 learning policy** (p1's line in slot p0; the frozen pool provides the diversity;
-  old p0 in `runs/sf/sf4/archive_p0/`). It starts at ≥ 6.4 GB free, with ≥ 2 workers. The watchdog
-  only counts downtime when there's RAM for the run.
-- **Day 11, 08:40: first gain since sf3's plateau.** sf4 at 899M samples = 1150, +46 over itself at
-  849M (1104) and +35 over sf3's best (1115) in the same round (`runs/sf/elo_sf4_2.txt`, 24 games
-  per pair, ±22). Needs confirmation in the next round.
-- **Not confirmed** (day 12, `runs/sf/elo_sf4_3.txt`): the same 899M snapshot rated 1061, and the latest
-  (950M) 1090 vs 1087 at the switch. The +46 was a ~2σ fluke. Lesson: confirm any single +2σ result
-  before reporting it as progress. Classic-mode strength has been flat for ~a week across phases 1–3
-  (best agents ~60–100 above idle).
-- **Phase 4: sf5 (day 12, 14:17)**: sf4 at 1.0B samples, plus random match modifiers rolled per episode
-  with the game's own probabilities and visible in the observation (`modifier_feature`: 7 values per
-  frame after the clock; frame 196 → 203, obs 812). Warm-started with zero weights on the new inputs
-  (max logit difference 4e-6). Headless matches keep all 25 bodies (no observation change).
-  `SnapshotOpponent` and `elo.py` trim each frame for older snapshots (784/780 inputs); `elo.py` has
-  `--modifiers random --modifier-feature` to rate players on random variants. `runs/sf5.sh`.
-- Day 13 throughput fixes: Sample Factory pins each learner to 1 torch thread (patched: `--learner_threads`,
-  default 4), `--num_epochs 2`, and back to 2 policies (two learners in parallel). Supervisors now also
-  *grow* a running run when RAM frees up (restart once ≥ 4 more workers fit).
-- sf5 results (days 13–15): **first confirmed classic gain.** Over three 30-games-per-pair rounds the
-  later p1 snapshots beat sf5's start by ~+30–50 and sf3's best by ~+30–60 (best: p1 at 1.22B samples,
-  1131 classic). On random variants, the whole frozen-opponent line (sf4/sf5, including its start)
-  rates ~30–40 above sf3/sf1, but the modifier inputs add nothing measurable yet.
-- Throughput by setup: MLP duels (sf1) ~8k samples/s; GRU duels (sf2/sf3) ~5k; GRU vs frozen opponents
-  (sf4/sf5) ~3.4k (1 sample per game step, plus a numpy opponent per worker); much lower when RAM-limited.
-- **sf6 (day 15, 01:24): back to self-play duels** from sf5's latest checkpoints (1.28B per policy),
-  same obs and settings: **~7,000–7,400 samples/s** on 14 workers (CPU-bound, load ~32). Experiment:
-  does it match sf5's gains at equal training time? If newer snapshots start losing to older ones,
-  bring frozen opponents back. `runs/sf6.sh`.
-- Day 15, sf6 after 12 h of duels: round-to-round noise (snapshots swinging ±30–40 between rounds) made
-  the broad rating rounds useless for decisions, so I switched to **600-game head-to-heads**
-  (`runs/sf/h2h_sf6_*.txt`, ±14). Result: sf6 latest (1.435B), sf6's start (= sf5 final) and sf5's
-  champion (p1 at 1.22B) are **equal within 10 Elo**, classic and random variants. Both duels and
-  frozen opponents have plateaued at this level.
-- `runs/sf7.sh`: frozen opponents from sf5's final weights, with sf6's snapshots and the exploiter's
-  (`runs/sf/sf8_exploit/pool_p0`) added to the pool. **Started day 18, 22:00** (resumed at 1.279B/1.280B).
-- **sf8_exploit (day 15, 16:42):** league-style exploiter. One policy trained only against the frozen
-  champion (`runs/sf/champion_pool/`: sf6 p0 at 1.435B), warm-started from sf6 p0's latest. Its
-  training win rate against the champion measures the champion's exploitable headroom.
-  `runs/sf8_exploit.sh`.
-- Exploiter after ~9 h: win 35% → 39%, loss 37% → 35% (draws ~27%). The champion has only small
-  exploitable weaknesses. Sanity check: the champion against itself through `SoccerVsPoolEnv` comes out
-  roughly even (37% / 32% over 100 games; P2 does somewhat better), so the frozen-opponent env isn't
-  biased. **Gotcha:** in Sample Factory's summaries, a tag matching "loss" can be a training-loss scalar,
-  not the game loss rate; use 1 − win − draw.
-- **Learning-rate bug (found day 19):** on resume, Sample Factory restores the learning rate from the
-  checkpoint and ignores `--learning_rate`. sf1/sf2 trained at 3e-4, so every warm-started run since (sf3–sf8)
-  ran at 3e-4, not the 1e-4 in its script. `examples/train_sf.py` now forces the command-line value; check
-  `train/lr` in TensorBoard after a restart. sf7 runs at a real 1e-4 from 1.339B/1.338B (day 19, 14:30).
-- **First confirmed gain since sf5 (day 24):** after ~770M samples per policy at the real 1e-4, sf7 p0
-  (2.108B) beats the champion (sf6 p0 1.435B) by +33 / +34 / +26 Elo in three 12,600-game head-to-heads
-  (classic seed 0, classic seed 7, random variants; `runs/sf/h2h_sf7_*.txt`). p1 (2.135B): +15 / +21 / +17.
-  sf7 p0 just after the fix (1.341B) rates level with the old champion, so the learning rate was a cap.
-  New champion: `runs/sf/champion_pool/champion_sf7_p0_2108M.npz`. sf7 keeps training; if it flattens,
-  try 3e-5 next.
-- sf7's supervisor thrashed (70 stop/starts overnight, ~2k samples/s instead of ~3.4k): with the larger
-  opponent pool, a worker takes ~0.75 GB, not 0.45. `runs/sf7.sh` now sizes at 700 MB per worker.
-- **Exploiter verdict (day 18, after ~29 h, 1.556B):** win 37%, loss 36%, draw 27%; the edge never grew
-  (9 h: 39/33, 27 h: 41/40). The champion has no exploitable weakness this method can find. Stopped;
-  its snapshots now feed sf7's pool for diversity.
-- Supervisor restarts can fail with "Components take too long to start" (28 games plus learners booting at
-  once on a loaded machine); the supervisor retries and the next attempt succeeds.
-- A 1-policy run (exploiter) is single-learner-bound: ~1,500–4,000 samples/s.
-- Queue after sf2 (GRU only, for a clean comparison): add `time_feature` (episode clock), so agents
-  can see the draw penalty coming and break stalemates on purpose.
-- Day 2, 17:00 Elo (3 snapshots per policy): p2 1082 → 1082 (71M → 168M samples), p0 1058 → 1058,
-  p1 1043 → 1027, only p3 still climbing (1027 → 1076). PPO E 1064, built-in AI 1034 (it swings ±50
-  between rounds), idle 1000. Three of four policies are flat since ~50–150M samples.
-- **Prepared, not started: `runs/sf2.sh`**, sf1 plus a GRU core (256 units, recurrence 64). GRU support
-  is end to end: `scripts/export_sf.py` exports it, `NumpyPolicy` runs it (matches Sample Factory over a
-  20-step sequence to 1e-7), and `elo.py`, `watch.py` and `SnapshotOpponent` reset the hidden state each
-  episode. Decision rule: if sf1's top is still ~1090 on the morning of day 3, stop sf1 and start sf2.
-- Day 2, 23:25 Elo: **sf1 is still improving.** Within the round: p0 1075 → 1103 (99M → 207M
-  samples), p2 1048 → 1077, while PPO E rated 993 (best sf1 policy +110, ~65% expected score). At 10:55
-  the gap was ~0. Ratings drift ±50–90 *between* rounds (PPO E: 1080 → 993 with no change to it), so
-  compare players within one round only. **Revised rule**: keep sf1 while its lead over PPO E and
-  over its own earlier snapshots keeps growing; switch to sf2 after a full day without growth.
-
-The SB3 path still works (`.venv`); `soccer_rl.noise.CorrelatedPolicy` now imports SB3 lazily.
-
-## Later ideas
-
-0. **The open question: is the ceiling the game or the methods?** A human baseline would settle it:
-   Cyprien playing the best agent with `examples/watch.py --human`. If he wins easily, the methods are
-   missing skill that exists. Ideas for that case: a recurrent policy to track momentum, behaviour
-   cloning from his games, or a league with exploiters (AlphaStar-style).
-
-1. **Throughput**: an async vec env (step whichever games are ready) would recover the ~60% lost to
-   lockstep reloads.
-2. **Credit assignment**: frame_skip 4, larger batches, a distributional critic.
-3. **Bigger networks**: residual MLPs with LayerNorm if the plain MLP saturates.
-4. **Random modifiers** (rain, ball types, ...) with the modifier settings added to the obs.
-
-## Gotchas that cost time (details in README)
-
-- **Sandbox**: the game can't run inside Claude Code's sandbox (steam-run's bwrap can't nest, and
-  `file` / the game die with SIGSYS); game-launching commands need the sandbox disabled.
-- **zsh doesn't word-split `$var`**: multi-word flags in a variable arrive as one argument (use
-  `${=var}`).
-- **SubprocVecEnv scripts need `if __name__ == "__main__":`** (forkserver start method).
-- **`uv` cache**: in the sandbox set `UV_CACHE_DIR` to a temp dir (`~/.cache/uv` is read-only).
-- **TMPDIR differs inside and outside the sandbox**; use the scratchpad path for files shared between both.
-- **Windowed game freezes after one tick** without `runInBackground` (the plugin forces it on).
-- **Logs disappear under `steam-run`** (private `/tmp`); the launcher captures stdout instead.
-- **The built-in AI only drives P2**, so `opponent="builtin"` requires `side="p1"`.
+### Day 18–25: sf7, the learning-rate fix
+- **sf7** (day 18, 22:00): frozen opponents from sf5's final weights (1.279B / 1.280B). The pool is
+  sf4–sf7 plus the exploiter.
+- The supervisor thrashed overnight (70 stop/starts) because a worker takes ~0.75 GB with this pool.
+  Now sized at 700 MB per worker.
+- Day 19: literature review and the learning-rate bug. sf7 has run at a real 1e-4 since
+  1.339B / 1.338B (day 19, 14:30).
+- Day 20: memory pressure from other processes (a `tsc` build was OOM-killed) caused a few stops,
+  all resumed cleanly. The watchdog was killed by Claude Code and not re-armed until day 24; training
+  ran fine meanwhile.
+- Day 24: three head-to-heads confirmed the gain (§4). The champion was promoted to sf7 p0 at
+  2.108B.
+- Day 25: final head-to-head (§1). Stopped at 15:00 for the move to another machine.
